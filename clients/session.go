@@ -1,25 +1,23 @@
 package clients
 
 import (
-	"container/list"
 	"sync"
 	"time"
 
-	"github.com/VolantMQ/mqttp"
-	"github.com/VolantMQ/persistence"
-	"github.com/VolantMQ/vlauth"
+	"github.com/VolantMQ/vlapi/mqttp"
+	"github.com/VolantMQ/vlapi/plugin/auth"
+	"github.com/VolantMQ/vlapi/plugin/persistence"
+	"github.com/VolantMQ/vlapi/subscriber"
 	"github.com/VolantMQ/volantmq/configuration"
 	"github.com/VolantMQ/volantmq/connection"
-	"github.com/VolantMQ/volantmq/subscriber"
-	"github.com/VolantMQ/volantmq/topics/types"
 	"github.com/VolantMQ/volantmq/types"
 	"go.uber.org/zap"
 )
 
 type sessionEvents interface {
-	sessionOffline(string, bool, *expiry)
-	connectionClosed(string, packet.ReasonCode)
-	subscriberShutdown(string, subscriber.SessionProvider)
+	sessionOffline(string, bool, *expiryConfig)
+	connectionClosed(string, mqttp.ReasonCode)
+	subscriberShutdown(string, vlsubscriber.IFace)
 }
 
 type sessionPreConfig struct {
@@ -34,12 +32,12 @@ type sessionPreConfig struct {
 
 type sessionConfig struct {
 	sessionEvents
-	subscriber subscriber.SessionProvider
-	will       *packet.Publish
-	expireIn   *uint32
-	willDelay  uint32
-	durable    bool
-	version    packet.ProtocolVersion
+	subscriber          vlsubscriber.IFace
+	will                *mqttp.Publish
+	expireIn            *uint32
+	durable             bool
+	sharedSubscriptions bool
+	version             mqttp.ProtocolVersion
 }
 
 type session struct {
@@ -51,26 +49,6 @@ type session struct {
 	sessionConfig
 }
 
-type temporaryPublish struct {
-	gList *list.List
-	qList *list.List
-}
-
-func newTmpPublish() *temporaryPublish {
-	return &temporaryPublish{
-		gList: list.New(),
-		qList: list.New(),
-	}
-}
-
-func (t *temporaryPublish) Publish(id string, p *packet.Publish) {
-	if p.QoS() == packet.QoS0 {
-		t.gList.PushBack(p)
-	} else {
-		t.qList.PushBack(p)
-	}
-}
-
 func newSession(c sessionPreConfig) *session {
 	s := &session{
 		sessionPreConfig: c,
@@ -80,121 +58,122 @@ func newSession(c sessionPreConfig) *session {
 	return s
 }
 
-func (s *session) configure(c sessionConfig, clean bool) {
+func (s *session) configure(c sessionConfig) {
 	s.sessionConfig = c
 
 	s.conn.SetOptions(connection.AttachSession(s))
-
-	if !clean {
-		tmp := newTmpPublish()
-		s.subscriber.Online(tmp)
-		s.persistence.PacketsForEach([]byte(s.id), s.conn)
-		s.subscriber.Online(s.conn)
-		s.persistence.PacketsDelete([]byte(s.id))
-		s.conn.LoadRemaining(tmp.gList, tmp.qList)
-	} else {
-		s.subscriber.Online(s.conn)
-	}
 }
 
 func (s *session) start() {
-	s.conn.Start()
 	s.idLock.Unlock()
 }
 
-func (s *session) stop(reason packet.ReasonCode) {
+func (s *session) stop(reason mqttp.ReasonCode) {
 	s.stopReq.Do(func() {
 		s.conn.Stop(reason)
 	})
 }
 
 // SignalPublish process PUBLISH packet from client
-func (s *session) SignalPublish(pkt *packet.Publish) error {
+func (s *session) SignalPublish(pkt *mqttp.Publish) error {
 	pkt.SetPublishID(s.subscriber.Hash())
 
 	// [MQTT-3.3.1.3]
 	if pkt.Retain() {
 		if err := s.messenger.Retain(pkt); err != nil {
-			s.log.Error("Error retaining message", zap.String("ClientID", s.id), zap.Error(err))
+			s.log.Error("Error retaining message", zap.String("clientId", s.id), zap.Error(err))
 		}
 
 		// [MQTT-3.3.1-7]
-		if pkt.QoS() == packet.QoS0 {
-			retained := packet.NewPublish(s.version)
+		if pkt.QoS() == mqttp.QoS0 {
+			retained := mqttp.NewPublish(s.version)
 			if err := retained.SetQoS(pkt.QoS()); err != nil {
-				s.log.Error("set retained QoS", zap.String("ClientID", s.id), zap.Error(err))
+				s.log.Error("set retained QoS", zap.String("clientId", s.id), zap.Error(err))
 			}
 			if err := retained.SetTopic(pkt.Topic()); err != nil {
-				s.log.Error("set retained topic", zap.String("ClientID", s.id), zap.Error(err))
+				s.log.Error("set retained topic", zap.String("clientId", s.id), zap.Error(err))
 			}
 		}
 	}
 
 	if err := s.messenger.Publish(pkt); err != nil {
-		s.log.Error("Couldn't publish", zap.String("ClientID", s.id), zap.Error(err))
+		s.log.Error("Couldn't publish", zap.String("clientId", s.id), zap.Error(err))
 	}
 
 	return nil
 }
 
 // SignalSubscribe process SUBSCRIBE packet from client
-func (s *session) SignalSubscribe(pkt *packet.Subscribe) (packet.Provider, error) {
-	m, _ := packet.New(s.version, packet.SUBACK)
-	resp, _ := m.(*packet.SubAck)
+func (s *session) SignalSubscribe(pkt *mqttp.Subscribe) (mqttp.IFace, error) {
+	m, _ := mqttp.New(s.version, mqttp.SUBACK)
+	resp, _ := m.(*mqttp.SubAck)
 
 	id, _ := pkt.ID()
 	resp.SetPacketID(id)
 
-	var retCodes []packet.ReasonCode
-	var retainedPublishes []*packet.Publish
+	var retCodes []mqttp.ReasonCode
+	var retainedPublishes []*mqttp.Publish
 
-	pkt.RangeTopics(func(t string, ops packet.SubscriptionOptions) {
-		reason := packet.CodeSuccess // nolint: ineffassign
+	subsID := uint32(0)
 
-		if err := s.permissions.ACL(s.id, s.username, t, vlauth.AccessRead); err == vlauth.StatusAllow {
-			subsID := uint32(0)
+	// V5.0 [MQTT-3.8.2.1.2]
+	if prop := pkt.PropertyGet(mqttp.PropertySubscriptionIdentifier); prop != nil {
+		if v, e := prop.AsInt(); e == nil {
+			subsID = v
+		}
+	}
 
-			// V5.0 [MQTT-3.8.2.1.2]
-			if prop := pkt.PropertyGet(packet.PropertySubscriptionIdentifier); prop != nil {
-				if v, e := prop.AsInt(); e == nil {
-					subsID = v
-				}
-			}
+	err := pkt.ForEachTopic(func(t *mqttp.Topic) error {
+		// V5.0
+		// [MQTT-3.8.3-4] It is a Protocol Error to set the No Local bit to 1 on a Shared Subscription
+		if t.Ops().NL() && (t.ShareName() != "") {
+			return mqttp.CodeProtocolError
+		}
 
-			subsParams := topicsTypes.SubscriptionParams{
-				ID:  subsID,
-				Ops: ops,
-			}
+		if !s.sharedSubscriptions && (t.ShareName() != "") {
+			return mqttp.CodeSharedSubscriptionNotSupported
+		}
 
-			if grantedQoS, retained, err := s.subscriber.Subscribe(t, &subsParams); err != nil {
-				reason = packet.QosFailure
+		return nil
+	})
+
+	if err != nil {
+		return nil, err
+	}
+
+	err = pkt.ForEachTopic(func(t *mqttp.Topic) error {
+		var reason mqttp.ReasonCode
+		if err = s.permissions.ACL(s.id, s.username, t.Filter(), vlauth.AccessRead); err == vlauth.StatusAllow {
+			if grantedQoS, retained, e := s.subscriber.Subscribe(t.Filter(), &vlsubscriber.SubscriptionParams{ID: subsID, Ops: t.Ops()}); e != nil {
+				reason = mqttp.QosFailure
 			} else {
-				reason = packet.ReasonCode(grantedQoS)
+				reason = mqttp.ReasonCode(grantedQoS)
 				retainedPublishes = append(retainedPublishes, retained...)
 			}
 		} else {
 			// [MQTT-3.9.3]
-			if s.version == packet.ProtocolV50 {
-				reason = packet.CodeNotAuthorized
+			if s.version == mqttp.ProtocolV50 {
+				reason = mqttp.CodeNotAuthorized
 			} else {
-				reason = packet.QosFailure
+				reason = mqttp.QosFailure
 			}
 		}
 
 		retCodes = append(retCodes, reason)
+		return nil
 	})
 
-	if err := resp.AddReturnCodes(retCodes); err != nil {
+	if err = resp.AddReturnCodes(retCodes); err != nil {
 		return nil, err
 	}
 
 	// Now put retained messages into publish queue
 	for _, rp := range retainedPublishes {
-		if p, err := rp.Clone(s.version); err == nil {
+		if p, e := rp.Clone(s.version); e == nil {
 			p.SetRetain(true)
 			s.conn.Publish(s.id, p)
 		} else {
-			s.log.Error("Couldn't clone PUBLISH message", zap.String("ClientID", s.id), zap.Error(err))
+			s.log.Error("Couldn't clone PUBLISH message", zap.String("clientId", s.id), zap.Error(e))
 		}
 	}
 
@@ -202,25 +181,26 @@ func (s *session) SignalSubscribe(pkt *packet.Subscribe) (packet.Provider, error
 }
 
 // SignalUnSubscribe process UNSUBSCRIBE packet from client
-func (s *session) SignalUnSubscribe(pkt *packet.UnSubscribe) (packet.Provider, error) {
-	var retCodes []packet.ReasonCode
+func (s *session) SignalUnSubscribe(pkt *mqttp.UnSubscribe) (mqttp.IFace, error) {
+	var retCodes []mqttp.ReasonCode
 
-	for _, t := range pkt.Topics() {
-		reason := packet.CodeSuccess
-		if err := s.permissions.ACL(s.id, s.username, t, vlauth.AccessRead); err == vlauth.StatusAllow {
-			if err = s.subscriber.UnSubscribe(t); err != nil {
+	pkt.ForEachTopic(func(t *mqttp.Topic) error {
+		reason := mqttp.CodeSuccess
+		if err := s.permissions.ACL(s.id, s.username, t.Full(), vlauth.AccessRead); err == vlauth.StatusAllow {
+			if err = s.subscriber.UnSubscribe(t.Full()); err != nil {
 				s.log.Error("Couldn't unsubscribe from topic", zap.Error(err))
-				reason = packet.CodeNoSubscriptionExisted
+				reason = mqttp.CodeNoSubscriptionExisted
 			}
 		} else {
-			reason = packet.CodeNotAuthorized
+			reason = mqttp.CodeNotAuthorized
 		}
 
 		retCodes = append(retCodes, reason)
-	}
+		return nil
+	})
 
-	m, _ := packet.New(s.version, packet.UNSUBACK)
-	resp, _ := m.(*packet.UnSubAck)
+	m, _ := mqttp.New(s.version, mqttp.UNSUBACK)
+	resp, _ := m.(*mqttp.UnSubAck)
 
 	id, _ := pkt.ID()
 	resp.SetPacketID(id)
@@ -232,25 +212,25 @@ func (s *session) SignalUnSubscribe(pkt *packet.UnSubscribe) (packet.Provider, e
 }
 
 // SignalDisconnect process DISCONNECT packet from client
-func (s *session) SignalDisconnect(pkt *packet.Disconnect) (packet.Provider, error) {
+func (s *session) SignalDisconnect(pkt *mqttp.Disconnect) (mqttp.IFace, error) {
 	var err error
 
-	err = packet.CodeSuccess
+	err = mqttp.CodeSuccess
 
-	if s.version == packet.ProtocolV50 {
+	if s.version == mqttp.ProtocolV50 {
 		// FIXME: CodeRefusedBadUsernameOrPassword has same id as CodeDisconnectWithWill
-		if pkt.ReasonCode() != packet.CodeRefusedBadUsernameOrPassword {
+		if pkt.ReasonCode() != mqttp.CodeRefusedBadUsernameOrPassword {
 			s.will = nil
 		}
 
-		if prop := pkt.PropertyGet(packet.PropertySessionExpiryInterval); prop != nil {
+		if prop := pkt.PropertyGet(mqttp.PropertySessionExpiryInterval); prop != nil {
 			if val, ok := prop.AsInt(); ok == nil {
 				// If the Session Expiry Interval in the CONNECT packet was zero, then it is a Protocol Error to set a non-
 				// zero Session Expiry Interval in the DISCONNECT packet sent by the Client. If such a non-zero Session
-				// Expiry Interval is received by the Server, it does not treat it as a valid DISCONNECT packet. The Server
+				// Expiry Interval is received by the Server, it does not treat it as a valid DISCONNECT mqttp. The Server
 				// uses DISCONNECT with Reason Code 0x82 (Protocol Error) as described in section 4.13.
 				if (s.expireIn != nil && *s.expireIn == 0) && val != 0 {
-					err = packet.CodeProtocolError
+					err = mqttp.CodeProtocolError
 				} else {
 					s.expireIn = &val
 				}
@@ -261,6 +241,10 @@ func (s *session) SignalDisconnect(pkt *packet.Disconnect) (packet.Provider, err
 	}
 
 	return nil, err
+}
+
+func (s *session) SignalOnline() {
+	s.subscriber.Online(s.conn.Publish)
 }
 
 // SignalOffline put subscriber in offline mode
@@ -277,7 +261,14 @@ func (s *session) SignalConnectionClose(params connection.DisconnectParams) {
 
 	// valid willMsg pointer tells we have will message
 	// if session is clean send will regardless to will delay
-	if s.will != nil && s.willDelay == 0 {
+	willIn := uint32(0)
+
+	if s.will != nil {
+		if val := s.will.PropertyGet(mqttp.PropertyWillDelayInterval); val != nil {
+			willIn, _ = val.AsInt()
+		}
+	}
+	if s.will != nil && willIn == 0 {
 		if err := s.messenger.Publish(s.will); err != nil {
 			s.log.Error("Publish will message", zap.String("ClientID", s.id), zap.Error(err))
 		}
@@ -286,32 +277,33 @@ func (s *session) SignalConnectionClose(params connection.DisconnectParams) {
 
 	s.connectionClosed(s.id, params.Reason)
 
-	if s.durable && len(params.Packets) > 0 {
-		if err := s.persistence.PacketsStore([]byte(s.id), params.Packets); err != nil {
-			s.log.Error("persisting packets", zap.String("ClientID", s.id), zap.Error(err))
-		}
-	}
-
-	keepContainer := s.durable && s.subscriber.HasSubscriptions()
+	keepContainer := (s.durable && s.subscriber.HasSubscriptions()) || (willIn > 0)
 
 	if !keepContainer {
 		s.subscriberShutdown(s.id, s.subscriber)
 		s.subscriber = nil
 	}
 
-	var exp *expiry
+	if s.durable {
+		if err := s.persistence.PacketsStore([]byte(s.id), params.Packets); err != nil {
+			s.log.Error("persisting packets", zap.String("clientId", s.id), zap.Error(err))
+		}
+	} else {
+		s.persistence.PacketsDelete([]byte(s.id))
+	}
 
-	if params.Reason != packet.CodeSessionTakenOver {
-		if s.willDelay > 0 || (s.expireIn != nil && *s.expireIn > 0) {
-			exp = newExpiry(
-				expiryConfig{
-					id:        s.id,
-					createdAt: s.createdAt,
-					messenger: s.messenger,
-					will:      s.will,
-					expireIn:  s.expireIn,
-					willDelay: s.willDelay,
-				})
+	var exp *expiryConfig
+
+	if params.Reason != mqttp.CodeSessionTakenOver {
+		if willIn > 0 || (s.expireIn != nil && *s.expireIn > 0) {
+			exp = &expiryConfig{
+				id:        s.id,
+				createdAt: s.createdAt,
+				messenger: s.messenger,
+				will:      s.will,
+				expireIn:  s.expireIn,
+				willIn:    willIn,
+			}
 
 			keepContainer = true
 		}
@@ -320,5 +312,4 @@ func (s *session) SignalConnectionClose(params connection.DisconnectParams) {
 	s.sessionOffline(s.id, keepContainer, exp)
 
 	s.stopReq.Do(func() {})
-	s.conn = nil
 }

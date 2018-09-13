@@ -6,8 +6,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/VolantMQ/mqttp"
-	"github.com/VolantMQ/persistence"
+	"github.com/VolantMQ/vlapi/mqttp"
+	"github.com/VolantMQ/vlapi/plugin"
+	"github.com/VolantMQ/vlapi/plugin/persistence"
+	"github.com/VolantMQ/vlapi/subscriber"
 	"github.com/VolantMQ/volantmq/clients"
 	"github.com/VolantMQ/volantmq/configuration"
 	"github.com/VolantMQ/volantmq/systree"
@@ -15,6 +17,7 @@ import (
 	"github.com/VolantMQ/volantmq/topics/types"
 	"github.com/VolantMQ/volantmq/transport"
 	"github.com/VolantMQ/volantmq/types"
+	"github.com/troian/healthcheck"
 	"go.uber.org/zap"
 )
 
@@ -30,13 +33,12 @@ var (
 	ErrInvalidNodeName = errors.New("node name is invalid")
 )
 
-type option func(*Server)
-
 // Config configuration of the MQTT server
 type Config struct {
 	MQTT configuration.MqttConfig
+
 	// Configuration of persistence provider
-	Persistence persistence.Provider
+	Persistence persistence.IFace
 
 	// OnDuplicate notify if there is attempt connect client with id that already exists and active
 	// If not not set than defaults to mock function
@@ -45,6 +47,8 @@ type Config struct {
 	// TransportStatus user provided callback to track transport status
 	// If not set than defaults to mock function
 	TransportStatus func(id string, status string)
+
+	Health healthcheck.Checks
 
 	// NodeName
 	NodeName string
@@ -58,9 +62,9 @@ type Server interface {
 	// Transport status reported over TransportStatus callback in server configuration
 	ListenAndServe(interface{}) error
 
-	// Close terminates the server by shutting down all the client connections and closing
+	// Shutdown terminates the server by shutting down all the client connections and closing
 	// configured listeners. It does full clean up of the resources and
-	Close() error
+	Shutdown() error
 }
 
 // server is a library implementation of the MQTT server that, as best it can, complies
@@ -84,6 +88,8 @@ type server struct {
 		wg        sync.WaitGroup
 	}
 }
+
+var _ vlplugin.Messaging = (*server)(nil)
 
 // NewServer allocate server object
 func NewServer(config Config) (Server, error) {
@@ -119,27 +125,12 @@ func NewServer(config Config) (Server, error) {
 		return nil, err
 	}
 
-	//generateNodeID := func() string {
-	//	return uuid.New() + "@volantmq.io"
-	//}
-
-	//if systemState.NodeName == "" || s.RewriteNodeName {
-	//	if s.NodeName == "" {
-	//		s.NodeName = generateNodeID()
-	//	}
-	//
-	//	systemState.NodeName = s.NodeName
-	//} else {
-	//	s.NodeName = systemState.NodeName
-	//}
-
 	if err = systemPersistence.SetInfo(systemState); err != nil {
 		return nil, err
 	}
 
 	var persisRetained persistence.Retained
 	var retains []types.RetainObject
-	//var dynPublishes []systree.DynamicValue
 
 	if s.sysTree, retains, s.systree.publishes, err = systree.NewTree("$SYS/servers/" + s.NodeName); err != nil {
 		return nil, err
@@ -151,7 +142,7 @@ func NewServer(config Config) (Server, error) {
 
 	topicsConfig.Stat = s.sysTree.Topics()
 	topicsConfig.Persist = persisRetained
-	topicsConfig.OverlappingSubscriptions = config.MQTT.Options.SubsOverlap
+	topicsConfig.OverlappingSubscriptions = s.MQTT.Options.SubsOverlap
 
 	if s.topicsMgr, err = topics.New(topicsConfig); err != nil {
 		return nil, err
@@ -167,7 +158,6 @@ func NewServer(config Config) (Server, error) {
 		}
 
 		if s.MQTT.Systree.UpdateInterval > 0 {
-			//s.systree.timer = time.AfterFunc(time.Duration(s.MQTT.Systree.UpdateInterval)*time.Second, s.systreeUpdater)
 			s.systree.timer = time.NewTicker(time.Duration(s.MQTT.Systree.UpdateInterval) * time.Second)
 			s.systree.wg.Add(1)
 			go s.systreeUpdater()
@@ -188,6 +178,11 @@ func NewServer(config Config) (Server, error) {
 	}
 
 	return s, nil
+}
+
+// GetSubscriber ...
+func (s *server) GetSubscriber(id string) (vlsubscriber.IFace, error) {
+	return s.sessionsMgr.GetSubscriber(id)
 }
 
 // ListenAndServe start listener
@@ -230,17 +225,35 @@ func (s *server) ListenAndServe(config interface{}) error {
 		s.TransportStatus(":"+l.Port(), "started")
 
 		status := "stopped"
+
+		s.Health.AddReadinessCheck("listener:"+l.Port(), func() error {
+			if e := l.Ready(); e != nil {
+				return e
+			}
+
+			return healthcheck.TCPDialCheck(":"+l.Port(), 1*time.Second)()
+		})
+
+		s.Health.AddLivenessCheck("listener:"+l.Port(), func() error {
+			if e := l.Alive(); e != nil {
+				return e
+			}
+
+			return healthcheck.TCPDialCheck(":"+l.Port(), 1*time.Second)()
+		})
+
 		if e := l.Serve(); e != nil {
 			status = e.Error()
 		}
+
 		s.TransportStatus(":"+l.Port(), status)
 	}()
 
 	return nil
 }
 
-// Close server
-func (s *server) Close() error {
+// Shutdown server
+func (s *server) Shutdown() error {
 	// By closing the quit channel, we are telling the server to stop accepting new
 	// connection.
 	s.onClose.Do(func() {
@@ -264,9 +277,7 @@ func (s *server) Close() error {
 			delete(s.transports.list, port)
 		}
 
-		if s.sessionsMgr != nil {
-			s.sessionsMgr.Shutdown() // nolint: errcheck, gas
-		}
+		s.sessionsMgr.Stop() // nolint: errcheck, gas
 
 		// shutdown systree updater
 		if s.systree.timer != nil {
@@ -274,7 +285,11 @@ func (s *server) Close() error {
 			s.systree.wg.Wait()
 		}
 
-		s.topicsMgr.Close() // nolint: errcheck, gas
+		s.topicsMgr.Stop() // nolint: errcheck, gas
+
+		s.sessionsMgr.Shutdown() // nolint: errcheck, gas
+
+		s.topicsMgr.Shutdown() // nolint: errcheck, gas
 	})
 
 	return nil
@@ -289,7 +304,7 @@ func (s *server) systreeUpdater() {
 	case <-s.systree.timer.C:
 		for _, val := range s.systree.publishes {
 			p := val.Publish()
-			pkt := packet.NewPublish(packet.ProtocolV311)
+			pkt := mqttp.NewPublish(mqttp.ProtocolV311)
 
 			pkt.SetPayload(p.Payload())
 			pkt.SetTopic(p.Topic())  // nolint: errcheck

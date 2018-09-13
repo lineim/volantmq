@@ -18,8 +18,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/VolantMQ/mqttp"
-	"github.com/VolantMQ/persistence"
+	"github.com/VolantMQ/vlapi/mqttp"
+	"github.com/VolantMQ/vlapi/plugin/persistence"
+	"github.com/VolantMQ/vlapi/subscriber"
 	"github.com/VolantMQ/volantmq/configuration"
 	"github.com/VolantMQ/volantmq/systree"
 	"github.com/VolantMQ/volantmq/topics/types"
@@ -36,7 +37,7 @@ type provider struct {
 	onCleanUnsubscribe func([]string)
 	wgPublisher        sync.WaitGroup
 	wgPublisherStarted sync.WaitGroup
-	inbound            chan *packet.Publish
+	inbound            chan *mqttp.Publish
 	inRetained         chan types.RetainObject
 	allowOverlapping   bool
 }
@@ -52,7 +53,7 @@ func NewMemProvider(config *topicsTypes.MemConfig) (topicsTypes.Provider, error)
 		stat:               config.Stat,
 		persist:            config.Persist,
 		onCleanUnsubscribe: config.OnCleanUnsubscribe,
-		inbound:            make(chan *packet.Publish, 1024*512),
+		inbound:            make(chan *mqttp.Publish, 1024*512),
 		inRetained:         make(chan types.RetainObject, 1024*512),
 	}
 	p.root = newNode(p.allowOverlapping, nil)
@@ -66,14 +67,16 @@ func NewMemProvider(config *topicsTypes.MemConfig) (topicsTypes.Provider, error)
 		}
 
 		for _, d := range entries {
-			v := packet.ProtocolVersion(d.Data[0])
-			pkt, _, err := packet.Decode(v, d.Data[1:])
+			v := mqttp.ProtocolVersion(d.Data[0])
+			var pkt mqttp.IFace
+			pkt, _, err = mqttp.Decode(v, d.Data[1:])
 			if err != nil {
 				p.log.Error("Couldn't decode retained message", zap.Error(err))
 			} else {
-				if m, ok := pkt.(*packet.Publish); ok {
+				if m, ok := pkt.(*mqttp.Publish); ok {
 					if len(d.ExpireAt) > 0 {
-						if tm, err := time.Parse(time.RFC3339, d.ExpireAt); err == nil {
+						var tm time.Time
+						if tm, err = time.Parse(time.RFC3339, d.ExpireAt); err == nil {
 							m.SetExpireAt(tm)
 						} else {
 							p.log.Error("Decode publish expire at", zap.Error(err))
@@ -100,18 +103,22 @@ func NewMemProvider(config *topicsTypes.MemConfig) (topicsTypes.Provider, error)
 	return p, nil
 }
 
-func (mT *provider) Subscribe(filter string, s topicsTypes.Subscriber, p *topicsTypes.SubscriptionParams) (packet.QosType, []*packet.Publish, error) {
+func (mT *provider) Subscribe(filter string, s topicsTypes.Subscriber, p *vlsubscriber.SubscriptionParams) (mqttp.QosType, []*mqttp.Publish, error) {
 	defer mT.smu.Unlock()
 	mT.smu.Lock()
+
+	if s == nil || p == nil {
+		return mqttp.QosType(0), []*mqttp.Publish{}, topicsTypes.ErrInvalidArgs
+	}
 
 	p.Granted = p.Ops.QoS()
 	exists := mT.subscriptionInsert(filter, s, p)
 
-	var r []*packet.Publish
+	var r []*mqttp.Publish
 
 	// [MQTT-3.3.1-5]
 	rh := p.Ops.RetainHandling()
-	if (rh == packet.RetainHandlingRetain) || ((rh == packet.RetainHandlingIfNotExists) && !exists) {
+	if (rh == mqttp.RetainHandlingRetain) || ((rh == mqttp.RetainHandlingIfNotExists) && !exists) {
 		mT.retainSearch(filter, &r)
 	}
 
@@ -126,7 +133,7 @@ func (mT *provider) UnSubscribe(topic string, sub topicsTypes.Subscriber) error 
 }
 
 func (mT *provider) Publish(m interface{}) error {
-	msg, ok := m.(*packet.Publish)
+	msg, ok := m.(*mqttp.Publish)
 	if !ok {
 		return topicsTypes.ErrUnexpectedObjectType
 	}
@@ -141,9 +148,9 @@ func (mT *provider) Retain(obj types.RetainObject) error {
 	return nil
 }
 
-func (mT *provider) Retained(filter string) ([]*packet.Publish, error) {
+func (mT *provider) Retained(filter string) ([]*mqttp.Publish, error) {
 	// [MQTT-3.3.1-5]
-	var r []*packet.Publish
+	var r []*mqttp.Publish
 
 	defer mT.smu.Unlock()
 	mT.smu.Lock()
@@ -154,28 +161,31 @@ func (mT *provider) Retained(filter string) ([]*packet.Publish, error) {
 	return r, nil
 }
 
-func (mT *provider) Close() error {
+func (mT *provider) Stop() error {
 	close(mT.inbound)
 	close(mT.inRetained)
 
 	mT.wgPublisher.Wait()
 
+	return nil
+}
+
+func (mT *provider) Shutdown() error {
 	defer mT.smu.Unlock()
 	mT.smu.Lock()
 
 	if mT.persist != nil {
-		var res []*packet.Publish
+		var res []*mqttp.Publish
 		// [MQTT-3.3.1-5]
 		mT.retainSearch("#", &res)
 		mT.retainSearch("/#", &res)
-		mT.retainSearch("$share/#", &res)
 
-		var encoded persistence.PersistedPackets
+		var encoded []*persistence.PersistedPacket
 
 		for _, pkt := range res {
 			// Discard retained expired and QoS0 messages
-			if expireAt, _, expired := pkt.Expired(); !expired && pkt.QoS() != packet.QoS0 {
-				if buf, err := packet.Encode(pkt); err != nil {
+			if expireAt, _, expired := pkt.Expired(); !expired && pkt.QoS() != mqttp.QoS0 {
+				if buf, err := mqttp.Encode(pkt); err != nil {
 					mT.log.Error("Couldn't encode retained message", zap.Error(err))
 				} else {
 					entry := &persistence.PersistedPacket{
@@ -206,9 +216,9 @@ func (mT *provider) retain(obj types.RetainObject) {
 	mT.smu.Lock()
 
 	switch t := obj.(type) {
-	case *packet.Publish:
+	case *mqttp.Publish:
 		// [MQTT-3.3.1-10]            [MQTT-3.3.1-7]
-		if len(t.Payload()) == 0 || t.QoS() == packet.QoS0 {
+		if len(t.Payload()) == 0 || t.QoS() == mqttp.QoS0 {
 			mT.retainRemove(obj.Topic()) // nolint: errcheck
 			if len(t.Payload()) == 0 {
 				insert = false

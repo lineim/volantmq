@@ -4,12 +4,13 @@ import (
 	"errors"
 	"time"
 
-	"github.com/VolantMQ/mqttp"
+	"github.com/VolantMQ/vlapi/mqttp"
+	"github.com/VolantMQ/vlapi/plugin/persistence"
 	"github.com/VolantMQ/volantmq/systree"
 	"github.com/VolantMQ/volantmq/transport"
 )
 
-type OnAuthCb func(string, *AuthParams) (packet.Provider, error)
+type OnAuthCb func(string, *AuthParams) (mqttp.IFace, error)
 
 type Option func(*impl) error
 
@@ -22,17 +23,20 @@ func (s *impl) SetOptions(opts ...Option) error {
 
 	return nil
 }
+
+// OfflineQoS0 if true QoS0 messages will be persisted when session is offline and durable
 func OfflineQoS0(val bool) Option {
 	return func(t *impl) error {
-		t.offlineQoS0 = val
+		wrOfflineQoS0(val)(t.tx)
 		return nil
 	}
 }
 
+// KeepAlive keep alive period
 func KeepAlive(val int) Option {
 	return func(t *impl) error {
-		vl := time.Duration(val) * time.Second
-		t.keepAlive = vl + (vl / 2)
+		vl := time.Duration(val+(val/2)) * time.Second
+		rdKeepAlive(vl)(t.rx)
 		return nil
 	}
 }
@@ -40,28 +44,29 @@ func KeepAlive(val int) Option {
 func Metric(val systree.PacketsMetric) Option {
 	return func(t *impl) error {
 		t.metric = val
+		wrMetric(val)(t.tx)
+		rdMetric(val)(t.rx)
 		return nil
 	}
 }
 
 func MaxRxPacketSize(val uint32) Option {
 	return func(t *impl) error {
-		t.maxRxPacketSize = val
+		rdMaxPacketSize(val)(t.rx)
 		return nil
 	}
 }
 
 func MaxTxPacketSize(val uint32) Option {
 	return func(t *impl) error {
-		t.maxTxPacketSize = val
+		wrMaxPacketSize(val)(t.tx)
 		return nil
 	}
 }
 
 func TxQuota(val int32) Option {
 	return func(t *impl) error {
-		t.txQuota = val
-		//t.pubOut.quota = val
+		wrQuota(val)(t.tx)
 		return nil
 	}
 }
@@ -69,14 +74,13 @@ func TxQuota(val int32) Option {
 func RxQuota(val int32) Option {
 	return func(t *impl) error {
 		t.rxQuota = val
-		//t.pubIn.quota = val
 		return nil
 	}
 }
 
 func MaxTxTopicAlias(val uint16) Option {
 	return func(t *impl) error {
-		t.maxTxTopicAlias = val
+		wrTopicAliasMax(val)(t.tx)
 		return nil
 	}
 }
@@ -107,7 +111,10 @@ func NetConn(val transport.Conn) Option {
 		if t.conn != nil {
 			return errors.New("already set")
 		}
+
 		t.conn = val
+		wrConn(val)(t.tx)
+		rdConn(val)(t.rx)
 		return nil
 	}
 }
@@ -119,5 +126,11 @@ func AttachSession(val SessionCallbacks) Option {
 		}
 		t.SessionCallbacks = val
 		return nil
+	}
+}
+
+func Persistence(val persistence.Packets) Option {
+	return func(t *impl) error {
+		return wrPersistence(val)(t.tx)
 	}
 }

@@ -15,18 +15,18 @@
 package connection
 
 import (
-	"container/list"
 	"crypto/rand"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/VolantMQ/mqttp"
-	"github.com/VolantMQ/persistence"
+	"github.com/VolantMQ/vlapi/mqttp"
+	"github.com/VolantMQ/vlapi/plugin/persistence"
 	"github.com/VolantMQ/volantmq/configuration"
 	"github.com/VolantMQ/volantmq/systree"
 	"github.com/VolantMQ/volantmq/transport"
@@ -51,39 +51,39 @@ var (
 	ErrPersistence = errors.New("session: error during persistence restore")
 )
 
-var expectedPacketType = map[state]map[packet.Type]bool{
-	stateConnecting: {packet.CONNECT: true},
+var expectedPacketType = map[state]map[mqttp.Type]bool{
+	stateConnecting: {mqttp.CONNECT: true},
 	stateAuth: {
-		packet.AUTH:       true,
-		packet.DISCONNECT: true,
+		mqttp.AUTH:       true,
+		mqttp.DISCONNECT: true,
 	},
 	stateConnected: {
-		packet.PUBLISH:     true,
-		packet.PUBACK:      true,
-		packet.PUBREC:      true,
-		packet.PUBREL:      true,
-		packet.PUBCOMP:     true,
-		packet.SUBSCRIBE:   true,
-		packet.SUBACK:      true,
-		packet.UNSUBSCRIBE: true,
-		packet.UNSUBACK:    true,
-		packet.PINGREQ:     true,
-		packet.AUTH:        true,
-		packet.DISCONNECT:  true,
+		mqttp.PUBLISH:     true,
+		mqttp.PUBACK:      true,
+		mqttp.PUBREC:      true,
+		mqttp.PUBREL:      true,
+		mqttp.PUBCOMP:     true,
+		mqttp.SUBSCRIBE:   true,
+		mqttp.SUBACK:      true,
+		mqttp.UNSUBSCRIBE: true,
+		mqttp.UNSUBACK:    true,
+		mqttp.PINGREQ:     true,
+		mqttp.AUTH:        true,
+		mqttp.DISCONNECT:  true,
 	},
 	stateReAuth: {
-		packet.PUBLISH:     true,
-		packet.PUBACK:      true,
-		packet.PUBREC:      true,
-		packet.PUBREL:      true,
-		packet.PUBCOMP:     true,
-		packet.SUBSCRIBE:   true,
-		packet.SUBACK:      true,
-		packet.UNSUBSCRIBE: true,
-		packet.UNSUBACK:    true,
-		packet.PINGREQ:     true,
-		packet.AUTH:        true,
-		packet.DISCONNECT:  true,
+		mqttp.PUBLISH:     true,
+		mqttp.PUBACK:      true,
+		mqttp.PUBREC:      true,
+		mqttp.PUBREL:      true,
+		mqttp.PUBCOMP:     true,
+		mqttp.SUBSCRIBE:   true,
+		mqttp.SUBACK:      true,
+		mqttp.UNSUBSCRIBE: true,
+		mqttp.UNSUBACK:    true,
+		mqttp.PINGREQ:     true,
+		mqttp.AUTH:        true,
+		mqttp.DISCONNECT:  true,
 	},
 }
 
@@ -104,13 +104,14 @@ func (s state) desc() string {
 	}
 }
 
+type signalConnectionClose func(error) bool
+type signalIncoming func(mqttp.IFace) error
+
 // DisconnectParams session state when stopped
 type DisconnectParams struct {
-	Reason  packet.ReasonCode
+	Reason  mqttp.ReasonCode
 	Packets persistence.PersistedPackets
 }
-
-//type onDisconnect func(*DisconnectParams)
 
 // Callbacks provided by sessions manager to signal session state
 type Callbacks struct {
@@ -123,14 +124,14 @@ type WillConfig struct {
 	Topic   string
 	Message []byte
 	Retain  bool
-	QoS     packet.QosType
+	QoS     mqttp.QosType
 }
 
 // AuthParams ...
 type AuthParams struct {
 	AuthMethod string
 	AuthData   []byte
-	Reason     packet.ReasonCode
+	Reason     mqttp.ReasonCode
 }
 
 // ConnectParams ...
@@ -139,103 +140,59 @@ type ConnectParams struct {
 	ID              string
 	Error           error
 	ExpireIn        *uint32
-	Will            *packet.Publish
+	Will            *mqttp.Publish
 	Username        []byte
 	Password        []byte
-	WillDelay       uint32
 	MaxTxPacketSize uint32
 	SendQuota       uint16
 	KeepAlive       uint16
 	IDGen           bool
 	CleanStart      bool
 	Durable         bool
-	Version         packet.ProtocolVersion
+	Version         mqttp.ProtocolVersion
 }
 
 // SessionCallbacks ...
 type SessionCallbacks interface {
-	SignalPublish(*packet.Publish) error
-	SignalSubscribe(*packet.Subscribe) (packet.Provider, error)
-	SignalUnSubscribe(*packet.UnSubscribe) (packet.Provider, error)
-	SignalDisconnect(*packet.Disconnect) (packet.Provider, error)
+	SignalPublish(*mqttp.Publish) error
+	SignalSubscribe(*mqttp.Subscribe) (mqttp.IFace, error)
+	SignalUnSubscribe(*mqttp.UnSubscribe) (mqttp.IFace, error)
+	SignalDisconnect(*mqttp.Disconnect) (mqttp.IFace, error)
+	SignalOnline()
 	SignalOffline()
 	SignalConnectionClose(DisconnectParams)
-}
-
-type ackQueues struct {
-	pubIn  ackQueue
-	pubOut ackQueue
-}
-
-type flow struct {
-	flowInUse   sync.Map
-	flowCounter uint32
-}
-
-type tx struct {
-	// txGMessages contains any messages except PUBLISH QoS 1/2
-	txGMessages list.List
-	// txQMessages contains PUBLISH QoS 1/2 messages. Separate queue is required to keep other messages sending
-	//             if quota reached
-	txQMessages     list.List
-	txGLock         sync.Mutex
-	txQLock         sync.Mutex
-	txLock          sync.Mutex
-	txTopicAlias    map[string]uint16
-	txWg            sync.WaitGroup
-	txTimer         *time.Timer
-	txRunning       uint32
-	txAvailable     chan int
-	txQuotaExceeded bool
-}
-type rx struct {
-	rxWg         sync.WaitGroup
-	connWg       sync.WaitGroup
-	rxTopicAlias map[uint16]string
-	rxRecv       []byte
-	keepAlive    time.Duration
-	rxRemaining  int
 }
 
 // impl of the connection
 type impl struct {
 	SessionCallbacks
-	id         string
-	metric     systree.PacketsMetric
-	conn       transport.Conn
-	signalAuth OnAuthCb
-	ackQueues
-	tx
-	rx
-	flow
-	quit              chan struct{}
-	connect           chan interface{}
-	onStart           types.Once
-	onConnDisconnect  types.OnceWait
-	started           sync.WaitGroup
-	log               *zap.SugaredLogger
-	authMethod        string
-	connectProcessed  uint32
-	maxRxPacketSize   uint32
-	maxTxPacketSize   uint32
-	txQuota           int32
-	rxQuota           int32
-	state             state
-	topicAliasCurrMax uint16
-	maxTxTopicAlias   uint16
-	maxRxTopicAlias   uint16
-	version           packet.ProtocolVersion
-	retainAvailable   bool
-	offlineQoS0       bool
+	id               string
+	conn             transport.Conn
+	metric           systree.PacketsMetric
+	signalAuth       OnAuthCb
+	onConnClose      func(error)
+	callStop         func(error) bool
+	tx               *writer
+	rx               *reader
+	quit             chan struct{}
+	connect          chan interface{}
+	onStart          types.Once
+	onConnDisconnect types.OnceWait
+	onStop           types.Once
+	started          sync.WaitGroup
+	log              *zap.SugaredLogger
+	pubIn            ackQueue
+	authMethod       string
+	connectProcessed uint32
+	rxQuota          int32
+	state            state
+	maxRxTopicAlias  uint16
+	version          mqttp.ProtocolVersion
+	retainAvailable  bool
 }
 
 type unacknowledged struct {
-	packet packet.Provider
-}
-
-// Size ...
-func (u *unacknowledged) Size() (int, error) {
-	return u.packet.Size()
+	mqttp.IFace
 }
 
 type sizeAble interface {
@@ -250,19 +207,16 @@ type baseAPI interface {
 type Initial interface {
 	baseAPI
 	Accept() (chan interface{}, error)
-	Send(packet.Provider) error
-	Acknowledge(p *packet.ConnAck, opts ...Option) bool
+	Send(mqttp.IFace) error
+	Acknowledge(p *mqttp.ConnAck, opts ...Option) bool
 	Session() Session
 }
 
 // Session ...
 type Session interface {
 	baseAPI
-	persistence.PacketLoader
-	Publish(string, *packet.Publish)
-	LoadRemaining(g, q *list.List)
+	Publish(string, *mqttp.Publish)
 	SetOptions(opts ...Option) error
-	Start() error
 }
 
 var _ Initial = (*impl)(nil)
@@ -270,26 +224,40 @@ var _ Session = (*impl)(nil)
 
 // New allocate new connection object
 func New(opts ...Option) Initial {
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Println(r)
+		}
+	}()
+
 	s := &impl{
 		state: stateConnecting,
 		quit:  make(chan struct{}),
+		tx:    newWriter(),
+		rx:    newReader(),
 	}
+
+	s.log = configuration.GetLogger().Named("connection")
+	s.onConnClose = s.onConnectionCloseStage1
+	s.callStop = s.stopNonAck
+
+	s.tx.setOptions(
+		wrLog(s.log),
+		wrOnConnClose(s.onConnectionClose),
+	)
+
+	s.rx.setOptions(
+		rdLog(s.log),
+		rdOnConnClose(s.onConnectionClose),
+		rdProcessIncoming(s.processIncoming),
+	)
 
 	for _, opt := range opts {
 		opt(s)
 	}
 
-	s.txAvailable = make(chan int, 1)
-	s.txTopicAlias = make(map[string]uint16)
-	s.rxTopicAlias = make(map[uint16]string)
-	s.txTimer = time.NewTimer(1 * time.Second)
-	s.txTimer.Stop()
-
 	s.started.Add(1)
 	s.pubIn.onRelease = s.onReleaseIn
-	s.pubOut.onRelease = s.onReleaseOut
-
-	s.log = configuration.GetLogger().Named("connection")
 
 	return s
 }
@@ -299,121 +267,85 @@ func (s *impl) Accept() (chan interface{}, error) {
 	var err error
 
 	defer func() {
-		if err != nil {
-			close(s.connect)
-			s.conn.Close()
+		if r := recover(); r != nil {
+			s.log.Panic(r)
 		}
 	}()
-	s.connect = make(chan interface{})
-
-	s.rxConnection()
-
-	return s.connect, nil
-}
-
-//func (s *impl) Accept() (chan interface{}, error) {
-//	var err error
-//
-//	defer func() {
-//		if err != nil {
-//			close(s.connect)
-//			s.conn.Close()
-//		}
-//	}()
-//	s.connect = make(chan interface{})
-//
-//	if s.keepAlive > 0 {
-//		if err = s.conn.SetReadDeadline(time.Now().Add(s.keepAlive)); err != nil {
-//			return nil, err
-//		}
-//	}
-//
-//	if err = s.conn.Start(s.rxConnection); err != nil {
-//		return nil, err
-//	}
-//
-//	return s.connect, nil
-//}
-
-// Session object
-func (s *impl) Session() Session {
-	return s
-}
-
-func (s *impl) Start() error {
-	defer s.txLock.Unlock()
-	s.txLock.Lock()
-
-	s.txRun()
-
-	return nil
-}
-
-// Send packet to connection
-func (s *impl) Send(pkt packet.Provider) (err error) {
 	defer func() {
 		if err != nil {
 			close(s.connect)
 			s.conn.Close()
 		}
 	}()
+	s.connect = make(chan interface{})
+	s.rx.setOptions(
+		rdConnect(s.connect),
+	)
 
-	if pkt.Type() == packet.AUTH {
+	s.rx.connection()
+
+	return s.connect, nil
+}
+
+// Session object
+func (s *impl) Session() Session {
+	return s
+}
+
+// Send packet to connection
+func (s *impl) Send(pkt mqttp.IFace) (err error) {
+	defer func() {
+		if err != nil {
+			close(s.connect)
+		}
+	}()
+
+	if pkt.Type() == mqttp.AUTH {
 		s.state = stateAuth
 	}
 
-	s.gPush(pkt)
+	s.tx.sendGeneric(pkt)
 
-	s.rxConnection()
+	s.rx.connection()
 
-	//if s.keepAlive.Nanoseconds() > 0 {
-	//	if err = s.conn.SetReadDeadline(time.Now().Add(s.keepAlive)); err != nil {
-	//		s.connect <- err
-	//		return
-	//	}
-	//}
-	//
-	//return s.conn.Resume()
 	return nil
 }
 
 // Acknowledge incoming connection
-func (s *impl) Acknowledge(p *packet.ConnAck, opts ...Option) bool {
+func (s *impl) Acknowledge(p *mqttp.ConnAck, opts ...Option) bool {
 	ack := true
 	s.conn.SetReadDeadline(time.Time{})
-	//s.conn.Stop()
-	s.connWg.Wait()
 
 	close(s.connect)
 
-	if p.ReturnCode() == packet.CodeSuccess {
+	if p.ReturnCode() == mqttp.CodeSuccess {
 		s.state = stateConnected
 
 		for _, opt := range opts {
 			opt(s)
 		}
-
-		//if s.keepAlive > 0 {
-		//	s.conn.SetReadDeadline(time.Now().Add(s.keepAlive))
-		//}
-		//if err := s.conn.Start(s.rxRun); err != nil {
-		//	s.log.Error("Cannot start receiver", zap.String("ClientID", s.id), zap.Error(err))
-		//	s.state = stateConnectFailed
-		//	ack = false
-		//}
 	} else {
 		s.state = stateConnectFailed
 		ack = false
 	}
 
-	buf, _ := packet.Encode(p)
+	buf, _ := mqttp.Encode(p)
 	bufs := net.Buffers{buf}
-	bufs.WriteTo(s.conn)
+
+	if _, err := bufs.WriteTo(s.conn); err != nil {
+		ack = false
+	} else {
+		s.metric.Sent(p.Type())
+	}
 
 	if !ack {
-		s.Stop(nil)
+		s.stopNonAck(nil)
 	} else {
-		s.rxRun()
+		s.onConnClose = s.onConnectionCloseStage2
+		s.callStop = s.onConnectionClose
+		s.SignalOnline()
+		s.rx.run()
+		s.tx.start(true)
 	}
 
 	return ack
@@ -423,70 +355,17 @@ func (s *impl) Acknowledge(p *packet.ConnAck, opts ...Option) bool {
 // or session is being replaced
 // Effective only first invoke
 func (s *impl) Stop(reason error) bool {
+	return s.callStop(reason)
+}
+
+func (s *impl) stopNonAck(reason error) bool {
+	s.tx.start(false)
 	return s.onConnectionClose(reason)
 }
 
-// LoadRemaining ...
-func (s *impl) LoadRemaining(g, q *list.List) {
-	select {
-	case <-s.quit:
-		return
-	default:
-	}
-	s.gLoadList(g)
-	s.qLoadList(q)
-}
-
-// LoadPersistedPacket ...
-func (s *impl) LoadPersistedPacket(entry *persistence.PersistedPacket) error {
-	var err error
-	var pkt packet.Provider
-
-	if pkt, _, err = packet.Decode(s.version, entry.Data); err != nil {
-		s.log.Error("Couldn't decode persisted message", zap.Error(err))
-		return ErrPersistence
-	}
-
-	if entry.Flags.UnAck {
-		switch p := pkt.(type) {
-		case *packet.Publish:
-			id, _ := p.ID()
-			s.flowReAcquire(id)
-		case *packet.Ack:
-			id, _ := p.ID()
-			s.flowReAcquire(id)
-		}
-
-		s.qLoad(&unacknowledged{packet: pkt})
-	} else {
-		if p, ok := pkt.(*packet.Publish); ok {
-			if len(entry.ExpireAt) > 0 {
-				var tm time.Time
-				if tm, err = time.Parse(time.RFC3339, entry.ExpireAt); err == nil {
-					p.SetExpireAt(tm)
-				} else {
-					s.log.Error("Parse publish expiry", zap.String("ClientID", s.id), zap.Error(err))
-				}
-			}
-
-			if p.QoS() == packet.QoS0 {
-				s.gLoad(pkt)
-			} else {
-				s.qLoad(pkt)
-			}
-		}
-	}
-
-	return nil
-}
-
 // Publish ...
-func (s *impl) Publish(id string, pkt *packet.Publish) {
-	if pkt.QoS() == packet.QoS0 {
-		s.gPush(pkt)
-	} else {
-		s.qPush(pkt)
-	}
+func (s *impl) Publish(id string, pkt *mqttp.Publish) {
+	s.tx.send(pkt)
 }
 
 func genClientID() string {
@@ -498,21 +377,7 @@ func genClientID() string {
 	return base64.URLEncoding.EncodeToString(b)
 }
 
-func (s *impl) getWill(pkt *packet.Connect) *packet.Publish {
-	var p *packet.Publish
-
-	if willTopic, willPayload, willQoS, willRetain, will := pkt.Will(); will {
-		p = packet.NewPublish(pkt.Version())
-		if err := p.Set(willTopic, willPayload, willQoS, willRetain, false); err != nil {
-			s.log.Error("Configure will packet", zap.String("ClientID", s.id), zap.Error(err))
-			p = nil
-		}
-	}
-
-	return p
-}
-
-func (s *impl) onConnect(pkt *packet.Connect) (packet.Provider, error) {
+func (s *impl) onConnect(pkt *mqttp.Connect) (mqttp.IFace, error) {
 	if atomic.CompareAndSwapUint32(&s.connectProcessed, 0, 1) {
 		id := string(pkt.ClientID())
 		idGen := false
@@ -526,7 +391,7 @@ func (s *impl) onConnect(pkt *packet.Connect) (packet.Provider, error) {
 		params := &ConnectParams{
 			ID:         id,
 			IDGen:      idGen,
-			Will:       s.getWill(pkt),
+			Will:       pkt.Will(),
 			KeepAlive:  pkt.KeepAlive(),
 			Version:    pkt.Version(),
 			CleanStart: pkt.IsClean(),
@@ -538,12 +403,21 @@ func (s *impl) onConnect(pkt *packet.Connect) (packet.Provider, error) {
 
 		s.readConnProperties(pkt, params)
 
+		s.tx.setOptions(
+			wrVersion(pkt.Version()),
+			wrID(id),
+		)
+
+		s.rx.setOptions(
+			rdVersion(pkt.Version()),
+		)
+
 		// MQTT v5 has different meaning of clean comparing to MQTT v3
 		//  - v3: if session is clean it is clean start and session lasts when Network connection closed
 		//  - v5: clean only means "clean start" and sessions lasts on connection close on if expire propery
 		//          exists and set to 0
-		if (params.Version <= packet.ProtocolV311 && params.CleanStart) ||
-			(params.Version >= packet.ProtocolV50 && params.ExpireIn != nil && *params.ExpireIn == 0) {
+		if (params.Version <= mqttp.ProtocolV311 && params.CleanStart) ||
+			(params.Version >= mqttp.ProtocolV50 && params.ExpireIn != nil && *params.ExpireIn == 0) {
 			params.Durable = false
 		}
 
@@ -552,13 +426,13 @@ func (s *impl) onConnect(pkt *packet.Connect) (packet.Provider, error) {
 	}
 
 	// It's protocol error to send CONNECT packet more than once
-	return nil, packet.CodeProtocolError
+	return nil, mqttp.CodeProtocolError
 }
 
-func (s *impl) onAuth(pkt *packet.Auth) (packet.Provider, error) {
+func (s *impl) onAuth(pkt *mqttp.Auth) (mqttp.IFace, error) {
 	// AUTH packets are allowed for v5.0 only
-	if s.version < packet.ProtocolV50 {
-		return nil, packet.CodeRefusedServerUnavailable
+	if s.version < mqttp.ProtocolV50 {
+		return nil, mqttp.CodeRefusedServerUnavailable
 	}
 
 	reason := pkt.ReasonCode()
@@ -567,9 +441,9 @@ func (s *impl) onAuth(pkt *packet.Auth) (packet.Provider, error) {
 	// during auth or re-auth Client must respond only AUTH with CodeContinueAuthentication
 	// if connection is being established Client must send AUTH only with CodeReAuthenticate
 	if (s.state == stateConnecting) ||
-		((s.state == stateAuth || s.state == stateReAuth) && (reason != packet.CodeContinueAuthentication)) ||
-		((s.state == stateConnected) && reason != (packet.CodeReAuthenticate)) {
-		return nil, packet.CodeProtocolError
+		((s.state == stateAuth || s.state == stateReAuth) && (reason != mqttp.CodeContinueAuthentication)) ||
+		((s.state == stateConnected) && reason != (mqttp.CodeReAuthenticate)) {
+		return nil, mqttp.CodeProtocolError
 	}
 
 	params := AuthParams{
@@ -577,7 +451,7 @@ func (s *impl) onAuth(pkt *packet.Auth) (packet.Provider, error) {
 	}
 
 	// [MQTT-3.15.2.2.2]
-	if prop := pkt.PropertyGet(packet.PropertyAuthMethod); prop != nil {
+	if prop := pkt.PropertyGet(mqttp.PropertyAuthMethod); prop != nil {
 		if val, e := prop.AsString(); e == nil {
 			params.AuthMethod = val
 		}
@@ -585,7 +459,7 @@ func (s *impl) onAuth(pkt *packet.Auth) (packet.Provider, error) {
 
 	// AUTH packet must provide AuthMethod property
 	if len(params.AuthMethod) == 0 {
-		return nil, packet.CodeProtocolError
+		return nil, mqttp.CodeProtocolError
 	}
 
 	// [MQTT-4.12.0-7] - If the Client does not include an Authentication Method in the CONNECT,
@@ -593,11 +467,11 @@ func (s *impl) onAuth(pkt *packet.Auth) (packet.Provider, error) {
 	// [MQTT-4.12.1-1] - The Client MUST set the Authentication Method to the same value as
 	//                   the Authentication Method originally used to authenticate the Network Connection
 	if len(s.authMethod) == 0 || s.authMethod != params.AuthMethod {
-		return nil, packet.CodeProtocolError
+		return nil, mqttp.CodeProtocolError
 	}
 
 	// [MQTT-3.15.2.2.3]
-	if prop := pkt.PropertyGet(packet.PropertyAuthData); prop != nil {
+	if prop := pkt.PropertyGet(mqttp.PropertyAuthData); prop != nil {
 		if val, e := prop.AsBinary(); e == nil {
 			params.AuthData = val
 		}
@@ -611,50 +485,48 @@ func (s *impl) onAuth(pkt *packet.Auth) (packet.Provider, error) {
 	return s.signalAuth(s.id, &params)
 }
 
-func (s *impl) readConnProperties(req *packet.Connect, params *ConnectParams) {
-	if s.version < packet.ProtocolV50 {
+func (s *impl) readConnProperties(req *mqttp.Connect, params *ConnectParams) {
+	if s.version < mqttp.ProtocolV50 {
 		return
 	}
 
 	// [MQTT-3.1.2.11.2]
-	if prop := req.PropertyGet(packet.PropertySessionExpiryInterval); prop != nil {
+	if prop := req.PropertyGet(mqttp.PropertySessionExpiryInterval); prop != nil {
 		if val, e := prop.AsInt(); e == nil {
 			params.ExpireIn = &val
 		}
 	}
 
-	// [MQTT-3.1.2.11.3]
-	if prop := req.PropertyGet(packet.PropertyWillDelayInterval); prop != nil {
-		if val, e := prop.AsInt(); e == nil {
-			params.WillDelay = val
-		}
-	}
-
 	// [MQTT-3.1.2.11.4]
-	if prop := req.PropertyGet(packet.PropertyReceiveMaximum); prop != nil {
+	if prop := req.PropertyGet(mqttp.PropertyReceiveMaximum); prop != nil {
 		if val, e := prop.AsShort(); e == nil {
-			//s.pubOut.quota = int32(val)
-			s.txQuota = int32(val)
+			s.tx.setOptions(
+				wrQuota(int32(val)),
+			)
 			params.SendQuota = val
 		}
 	}
 
 	// [MQTT-3.1.2.11.5]
-	if prop := req.PropertyGet(packet.PropertyMaximumPacketSize); prop != nil {
+	if prop := req.PropertyGet(mqttp.PropertyMaximumPacketSize); prop != nil {
 		if val, e := prop.AsInt(); e == nil {
-			s.maxTxPacketSize = val
+			s.tx.setOptions(
+				wrMaxPacketSize(val),
+			)
 		}
 	}
 
 	// [MQTT-3.1.2.11.6]
-	if prop := req.PropertyGet(packet.PropertyTopicAliasMaximum); prop != nil {
+	if prop := req.PropertyGet(mqttp.PropertyTopicAliasMaximum); prop != nil {
 		if val, e := prop.AsShort(); e == nil {
-			s.maxTxTopicAlias = val
+			s.tx.setOptions(
+				wrTopicAliasMax(val),
+			)
 		}
 	}
 
 	// [MQTT-3.1.2.11.10]
-	if prop := req.PropertyGet(packet.PropertyAuthMethod); prop != nil {
+	if prop := req.PropertyGet(mqttp.PropertyAuthMethod); prop != nil {
 		if val, e := prop.AsString(); e == nil {
 			params.AuthMethod = val
 			s.authMethod = val
@@ -662,9 +534,9 @@ func (s *impl) readConnProperties(req *packet.Connect, params *ConnectParams) {
 	}
 
 	// [MQTT-3.1.2.11.11]
-	if prop := req.PropertyGet(packet.PropertyAuthData); prop != nil {
+	if prop := req.PropertyGet(mqttp.PropertyAuthData); prop != nil {
 		if len(params.AuthMethod) == 0 {
-			params.Error = packet.CodeProtocolError
+			params.Error = mqttp.CodeProtocolError
 			return
 		}
 		if val, e := prop.AsBinary(); e == nil {
@@ -675,9 +547,9 @@ func (s *impl) readConnProperties(req *packet.Connect, params *ConnectParams) {
 	return
 }
 
-func (s *impl) processIncoming(p packet.Provider) error {
+func (s *impl) processIncoming(p mqttp.IFace) error {
 	var err error
-	var resp packet.Provider
+	var resp mqttp.IFace
 
 	// [MQTT-3.1.2-33] - If a Client sets an Authentication Method in the CONNECT,
 	//                   the Client MUST NOT send any packets other than AUTH or DISCONNECT packets
@@ -687,124 +559,55 @@ func (s *impl) processIncoming(p packet.Provider) error {
 			zap.String("ClientID", s.id),
 			zap.String("state", s.state.desc()),
 			zap.String("packet", p.Type().Name()))
-		return packet.CodeProtocolError
+		return mqttp.CodeProtocolError
 	}
 
 	switch pkt := p.(type) {
-	case *packet.Connect:
+	case *mqttp.Connect:
 		resp, err = s.onConnect(pkt)
-	case *packet.Auth:
+	case *mqttp.Auth:
 		resp, err = s.onAuth(pkt)
-	case *packet.Publish:
+	case *mqttp.Publish:
 		resp, err = s.onPublish(pkt)
-	case *packet.Ack:
+	case *mqttp.Ack:
 		resp, err = s.onAck(pkt)
-	case *packet.Subscribe:
+	case *mqttp.Subscribe:
 		resp, err = s.SignalSubscribe(pkt)
-	case *packet.UnSubscribe:
+	case *mqttp.UnSubscribe:
 		resp, err = s.SignalUnSubscribe(pkt)
-	case *packet.PingReq:
-		// For PINGREQ message, we should send back PINGRESP
-		resp = packet.NewPingResp(s.version)
-	case *packet.Disconnect:
+	case *mqttp.PingReq:
+		resp = mqttp.NewPingResp(s.version)
+	case *mqttp.Disconnect:
+		s.onStop.Do(func() {
+			s.SignalOffline()
+			s.tx.stop()
+		})
+
 		resp, err = s.SignalDisconnect(pkt)
 	}
 
 	if resp != nil {
-		s.gPush(resp)
+		s.tx.send(resp)
 	}
 
 	return err
 }
 
-func (s *impl) getQueuedPackets() persistence.PersistedPackets {
-	var packets persistence.PersistedPackets
-
-	packetEncode := func(p interface{}) {
-		var pkt packet.Provider
-		pPkt := &persistence.PersistedPacket{}
-
-		pPkt.Flags.UnAck = false
-
-		switch tp := p.(type) {
-		case *packet.Publish:
-			if expireAt, _, expired := tp.Expired(); expired && (s.offlineQoS0 || tp.QoS() != packet.QoS0) {
-				if !expireAt.IsZero() {
-					pPkt.ExpireAt = expireAt.Format(time.RFC3339)
-				}
-
-				if tp.QoS() != packet.QoS0 {
-					// make sure message has some IDType to prevent encode error
-					tp.SetPacketID(0)
-				}
-
-				pkt = tp
-			}
-		case *unacknowledged:
-			if pb, ok := tp.packet.(*packet.Publish); ok && pb.QoS() == packet.QoS1 {
-				pb.SetDup(true)
-			}
-
-			pkt = tp.packet
-			pPkt.Flags.UnAck = true
-		}
-
-		if pkt != nil {
-			var err error
-			if pPkt.Data, err = packet.Encode(pkt); err != nil {
-				s.log.Error("Couldn't encode message for persistence", zap.Error(err))
-			} else {
-				packets = append(packets, pPkt)
-			}
-		}
-	}
-
-	var next *list.Element
-	for elem := s.txQMessages.Front(); elem != nil; elem = next {
-		next = elem.Next()
-		packetEncode(s.txQMessages.Remove(elem))
-	}
-
-	for elem := s.txGMessages.Front(); elem != nil; elem = next {
-		next = elem.Next()
-		switch tp := s.txGMessages.Remove(elem).(type) {
-		case *packet.Publish:
-			packetEncode(tp)
-		}
-	}
-
-	s.pubOut.messages.Range(func(k, v interface{}) bool {
-		if pkt, ok := v.(packet.Provider); ok {
-			packetEncode(&unacknowledged{packet: pkt})
-		}
-
-		s.pubOut.messages.Delete(k)
-		return true
-	})
-
-	s.pubIn.messages.Range(func(k, v interface{}) bool {
-		s.pubIn.messages.Delete(k)
-		return true
-	})
-
-	return packets
-}
-
 // forward PUBLISH message to topics manager which takes care about subscribers
-func (s *impl) publishToTopic(p *packet.Publish) error {
+func (s *impl) publishToTopic(p *mqttp.Publish) error {
 	// v5.0
 	// If the Server included Retain Available in its CONNACK response to a Client with its value set to 0 and it
 	// receives a PUBLISH packet with the RETAIN flag is set to 1, then it uses the DISCONNECT Reason
 	// Code of 0x9A (Retain not supported) as described in section 4.13.
-	if s.version >= packet.ProtocolV50 {
+	if s.version >= mqttp.ProtocolV50 {
 		// [MQTT-3.3.2.3.4]
-		if prop := p.PropertyGet(packet.PropertyTopicAlias); prop != nil {
+		if prop := p.PropertyGet(mqttp.PropertyTopicAlias); prop != nil {
 			if val, err := prop.AsShort(); err == nil {
 				if len(p.Topic()) != 0 {
 					// renew alias with new topic
-					s.rxTopicAlias[val] = p.Topic()
+					s.rx.topicAlias[val] = p.Topic()
 				} else {
-					if topic, kk := s.rxTopicAlias[val]; kk {
+					if topic, kk := s.rx.topicAlias[val]; kk {
 						// do not check for error as topic has been validated when arrived
 						if err = p.SetTopic(topic); err != nil {
 							s.log.Error("publish to topic",
@@ -813,18 +616,20 @@ func (s *impl) publishToTopic(p *packet.Publish) error {
 								zap.Error(err))
 						}
 					} else {
-						return packet.CodeInvalidTopicAlias
+						return mqttp.CodeInvalidTopicAlias
 					}
 				}
 			} else {
-				return packet.CodeInvalidTopicAlias
+				return mqttp.CodeInvalidTopicAlias
 			}
 		}
 
 		// [MQTT-3.3.2.3.3]
-		if prop := p.PropertyGet(packet.PropertyPublicationExpiry); prop != nil {
+		if prop := p.PropertyGet(mqttp.PropertyPublicationExpiry); prop != nil {
 			if val, err := prop.AsInt(); err == nil {
-				s.log.Warn("Set pub expiration", zap.String("ClientID", s.id), zap.Duration("val", time.Duration(val)*time.Second))
+				s.log.Debug("Set pub expiration",
+					zap.String("ClientID", s.id),
+					zap.Duration("val", time.Duration(val)*time.Second))
 				p.SetExpireAt(time.Now().Add(time.Duration(val) * time.Second))
 			} else {
 				return err
@@ -836,24 +641,251 @@ func (s *impl) publishToTopic(p *packet.Publish) error {
 }
 
 // onReleaseIn ack process for incoming messages
-func (s *impl) onReleaseIn(o, n packet.Provider) {
+func (s *impl) onReleaseIn(o, n mqttp.IFace) {
 	switch p := o.(type) {
-	case *packet.Publish:
-		s.SignalPublish(p)
+	case *mqttp.Publish:
+		s.publishToTopic(p)
 	}
 }
 
-// onReleaseOut process messages that required ack cycle
-// onAckTimeout if publish message has not been acknowledged withing specified ackTimeout
-// server should mark it as a dup and send again
-func (s *impl) onReleaseOut(o, n packet.Provider) {
-	switch n.Type() {
-	case packet.PUBACK:
-		fallthrough
-	case packet.PUBCOMP:
-		id, _ := n.ID()
-		if s.flowRelease(id) {
-			s.signalQuota()
+func (s *impl) onConnectionCloseStage1(status error) {
+	// shutdown quit channel tells all routines finita la commedia
+	close(s.quit)
+
+	s.conn.SetReadDeadline(time.Time{})
+
+	select {
+	case <-s.connect:
+	default:
+		close(s.connect)
+	}
+
+	s.tx.stop()
+
+	s.rx.shutdown()
+	s.tx.shutdown()
+	s.tx = nil
+	s.rx = nil
+
+	s.state = stateDisconnected
+
+	if err := s.conn.Close(); err != nil {
+		s.log.Warn("close connection", zap.String("clientId", s.id), zap.Error(err))
+	}
+
+	s.conn = nil
+}
+
+func (s *impl) onConnectionCloseStage2(status error) {
+	// shutdown quit channel tells all routines finita la commedia
+	close(s.quit)
+
+	var err error
+	s.conn.SetReadDeadline(time.Time{})
+
+	// clean up transmitter to allow send disconnect command to client if needed
+	s.onStop.Do(func() {
+		// gracefully shutdown receiver by setting some small ReadDeadline
+		s.conn.SetReadDeadline(time.Now().Add(time.Microsecond))
+		s.rx.shutdown()
+
+		s.SignalOffline()
+
+		s.tx.stop()
+	})
+
+	if reason, ok := status.(mqttp.ReasonCode); ok &&
+		reason != mqttp.CodeSuccess && s.version >= mqttp.ProtocolV50 {
+		// server wants to tell client disconnect reason
+		pkt := mqttp.NewDisconnect(s.version)
+		pkt.SetReasonCode(reason)
+
+		var buf []byte
+		if buf, err = mqttp.Encode(pkt); err != nil {
+			s.log.Error("encode disconnect packet", zap.String("ClientID", s.id), zap.Error(err))
+		} else {
+			var written int
+			if written, err = s.conn.Write(buf); written != len(buf) {
+				s.log.Error("write disconnect message",
+					zap.String("clientId", s.id),
+					zap.Int("packet size", len(buf)),
+					zap.Int("written", written))
+			} else if err != nil {
+				s.log.Debug("write disconnect message",
+					zap.String("clientId", s.id),
+					zap.Error(err))
+			}
 		}
 	}
+
+	if err = s.conn.Close(); err != nil {
+		s.log.Error("close connection", zap.String("clientId", s.id), zap.Error(err))
+	}
+
+	s.tx.shutdown()
+	s.conn = nil
+
+	params := DisconnectParams{
+		Packets: s.tx.getQueuedPackets(),
+		Reason:  mqttp.CodeSuccess,
+	}
+
+	s.tx = nil
+	s.rx = nil
+
+	if rc, ok := err.(mqttp.ReasonCode); ok {
+		params.Reason = rc
+	}
+
+	s.SignalConnectionClose(params)
+
+	s.state = stateDisconnected
+
+	s.pubIn.messages.Range(func(k, v interface{}) bool {
+		s.pubIn.messages.Delete(k)
+		return true
+	})
+}
+
+func (s *impl) onConnectionClose(status error) bool {
+	return s.onConnDisconnect.Do(func() {
+		s.onConnClose(status)
+	})
+}
+
+// onPublish invoked when server receives PUBLISH message from remote
+// On QoS == 0, we should just take the next step, no ack required
+// On QoS == 1, send back PUBACK, then take the next step
+// On QoS == 2, we need to put it in the ack queue, send back PUBREC
+func (s *impl) onPublish(pkt *mqttp.Publish) (mqttp.IFace, error) {
+	// check for topic access
+	var err error
+	reason := mqttp.CodeSuccess
+
+	if s.version >= mqttp.ProtocolV50 {
+		if !s.retainAvailable && pkt.Retain() {
+			return nil, mqttp.CodeRetainNotSupported
+		}
+
+		if prop := pkt.PropertyGet(mqttp.PropertyTopicAlias); prop != nil {
+			if val, ok := prop.AsShort(); ok == nil && (val == 0 || val > s.maxRxTopicAlias) {
+				return nil, mqttp.CodeInvalidTopicAlias
+			}
+		}
+	}
+
+	var resp mqttp.IFace
+
+	// This case is for V5.0 actually as ack messages may return status.
+	// To deal with V3.1.1 two ways left:
+	//   - ignore the message but send acks
+	//   - return error leading to disconnect
+	// TODO: publish permissions
+
+	switch pkt.QoS() {
+	case mqttp.QoS2:
+		if s.rxQuota == 0 {
+			err = mqttp.CodeReceiveMaximumExceeded
+		} else {
+			s.rxQuota--
+			r := mqttp.NewPubRec(s.version)
+			id, _ := pkt.ID()
+
+			r.SetPacketID(id)
+
+			resp = r
+
+			// [MQTT-4.3.3-9]
+			// store incoming QoS 2 message before sending PUBREC as theoretically PUBREL
+			// might come before store in case message store done after write PUBREC
+			if reason < mqttp.CodeUnspecifiedError {
+				s.pubIn.store(pkt)
+			}
+
+			r.SetReason(mqttp.CodeSuccess)
+		}
+	case mqttp.QoS1:
+		if s.rxQuota == 0 {
+			err = mqttp.CodeReceiveMaximumExceeded
+			break
+		}
+
+		r := mqttp.NewPubAck(s.version)
+
+		id, _ := pkt.ID()
+
+		r.SetPacketID(id)
+		r.SetReason(reason)
+		resp = r
+		fallthrough
+	case mqttp.QoS0: // QoS 0
+		// [MQTT-4.3.1]
+		// [MQTT-4.3.2-4]
+		// TODO(troian): ignore if publish permissions not validated
+		if err = s.publishToTopic(pkt); err != nil {
+			s.log.Error("Couldn't publish message",
+				zap.String("ClientID", s.id),
+				zap.Uint8("QoS", uint8(pkt.QoS())),
+				zap.Error(err))
+		}
+	}
+
+	return resp, err
+}
+
+// onAck handle ack acknowledgment received from remote
+func (s *impl) onAck(pkt mqttp.IFace) (mqttp.IFace, error) {
+	var resp mqttp.IFace
+	switch mIn := pkt.(type) {
+	case *mqttp.Ack:
+		switch pkt.Type() {
+		case mqttp.PUBACK:
+			// remote acknowledged PUBLISH QoS 1 message sent by this server
+			s.tx.pubOut.release(pkt)
+		case mqttp.PUBREC:
+			// remote received PUBLISH message sent by this server
+			s.tx.pubOut.release(pkt)
+
+			discard := false
+
+			id, _ := pkt.ID()
+
+			if s.version == mqttp.ProtocolV50 && mIn.Reason() >= mqttp.CodeUnspecifiedError {
+				// v5.0 [MQTT-4.9]
+				s.tx.releaseID(id)
+				discard = true
+			}
+
+			if !discard {
+				resp, _ = mqttp.New(s.version, mqttp.PUBREL)
+				r, _ := resp.(*mqttp.Ack)
+
+				r.SetPacketID(id)
+
+				// 2. Put PUBREL into ack queue
+				// Do it before writing into network as theoretically response may come
+				// faster than put into queue
+				s.tx.pubOut.store(resp)
+			}
+		case mqttp.PUBREL:
+			// Remote has released PUBLISH
+			resp, _ = mqttp.New(s.version, mqttp.PUBCOMP)
+			r, _ := resp.(*mqttp.Ack)
+
+			id, _ := pkt.ID()
+			r.SetPacketID(id)
+
+			s.pubIn.release(pkt)
+			s.rxQuota++
+		case mqttp.PUBCOMP:
+			// PUBREL message has been acknowledged, release from queue
+			s.tx.pubOut.release(pkt)
+		default:
+			s.log.Error("Unsupported ack message type",
+				zap.String("ClientID", s.id),
+				zap.String("type", pkt.Type().Name()))
+		}
+	}
+
+	return resp, nil
 }

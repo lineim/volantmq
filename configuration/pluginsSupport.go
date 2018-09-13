@@ -1,16 +1,12 @@
+// +build !woPlugins
+
 package configuration
 
 import (
 	"plugin"
 
-	"github.com/VolantMQ/vlplugin"
+	"github.com/VolantMQ/vlapi/plugin"
 )
-
-// PluginState status
-type PluginState struct {
-	Plugin vlplugin.Plugin
-	Errors []error
-}
 
 // LoadPlugins load plugins from path
 func LoadPlugins(path string, list []string) map[string]PluginState {

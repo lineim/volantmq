@@ -4,14 +4,10 @@ import (
 	"errors"
 	"regexp"
 
-	"github.com/VolantMQ/mqttp"
+	"github.com/VolantMQ/vlapi/mqttp"
+	"github.com/VolantMQ/vlapi/subscriber"
 	"github.com/VolantMQ/volantmq/types"
 )
-
-//var (
-//	// ErrUnknownProvider unknown provider
-//	ErrUnknownProvider = errors.New("Unknown provider")
-//)
 
 const (
 	// MWC is the multi-level wildcard
@@ -21,13 +17,7 @@ const (
 	SWC = "+"
 
 	// SEP is the topic level separator
-	//SEP = "/"
-
-	// SYS is the starting character of the system level topics
-	//SYS = "$"
-
-	// Both wildcards
-	//BWC = "#+"
+	SEP = "/"
 )
 
 var (
@@ -57,18 +47,13 @@ var (
 
 	// ErrNotFound object not found
 	ErrNotFound = errors.New("topics: not found")
-
-	// ErrNotOpen storage is not open
-	//ErrNotOpen = errors.New("not open")
-
-	//ErrOverflow = errors.New("overflow")
 )
 
 // Subscriber used inside each session as an object to provide to topic manager upon subscribe
 type Subscriber interface {
 	Acquire()
 	Release()
-	Publish(*packet.Publish, packet.QosType, packet.SubscriptionOptions, []uint32) error
+	Publish(*mqttp.Publish, mqttp.QosType, mqttp.SubscriptionOptions, []uint32) error
 	Hash() uintptr
 }
 
@@ -77,34 +62,22 @@ type Subscribers []Subscriber
 
 // Provider interface
 type Provider interface {
-	Subscribe(string, Subscriber, *SubscriptionParams) (packet.QosType, []*packet.Publish, error)
+	Subscribe(string, Subscriber, *vlsubscriber.SubscriptionParams) (mqttp.QosType, []*mqttp.Publish, error)
 	UnSubscribe(string, Subscriber) error
 	Publish(interface{}) error
 	Retain(types.RetainObject) error
-	Retained(string) ([]*packet.Publish, error)
-	Close() error
+	Retained(string) ([]*mqttp.Publish, error)
+	Stop() error
+	Shutdown() error
 }
 
 // SubscriberInterface used by subscriber to handle messages
 type SubscriberInterface interface {
 	Publish(interface{}) error
-	Subscribe(string, Subscriber, *SubscriptionParams) (packet.QosType, []*packet.Publish, error)
+	Subscribe(string, Subscriber, *vlsubscriber.SubscriptionParams) (mqttp.QosType, []*mqttp.Publish, error)
 	UnSubscribe(string, Subscriber) error
 	Retain(types.RetainObject) error
-	Retained(string) ([]*packet.Publish, error)
-}
-
-// SubscriptionParams parameters of the subscription
-type SubscriptionParams struct {
-	// Subscription id
-	// V5.0 ONLY
-	ID uint32
-
-	// Ops requested subscription options
-	Ops packet.SubscriptionOptions
-
-	// Granted QoS granted by topics manager
-	Granted packet.QosType
+	Retained(string) ([]*mqttp.Publish, error)
 }
 
 var (

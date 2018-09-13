@@ -2,33 +2,33 @@
 
 
 [[projects]]
-  name = "github.com/VolantMQ/mqttp"
-  packages = ["."]
-  revision = "e20fb4232051bca65b1d623ef69813ea213b38a0"
-  version = "v0.0.1"
+  branch = "master"
+  name = "github.com/VolantMQ/vlapi"
+  packages = [
+    "mqttp",
+    "plugin",
+    "plugin/auth",
+    "plugin/persistence",
+    "subscriber"
+  ]
+  revision = "b6c8c1370258f23112edad5918518d1798867b64"
 
 [[projects]]
   branch = "master"
-  name = "github.com/VolantMQ/persistence"
-  packages = ["."]
-  revision = "1e90fe4c5a562943a73ecf706926700225bcfe1e"
-
-[[projects]]
-  branch = "master"
-  name = "github.com/VolantMQ/vlauth"
-  packages = ["."]
-  revision = "58fa3533cbf0fa378f6528fc5e05a0e23c8be4a5"
-
-[[projects]]
-  branch = "master"
-  name = "github.com/VolantMQ/vlplugin"
-  packages = ["."]
-  revision = "fcffa566ad4397405c5a75c45bac6a6e025a1027"
+  name = "github.com/beorn7/perks"
+  packages = ["quantile"]
+  revision = "3a771d992973f24aa725d07868b467d1ddfceafb"
 
 [[projects]]
   name = "github.com/davecgh/go-spew"
   packages = ["spew"]
   revision = "346938d642f2ec3594ed81d874461961cd0faa76"
+  version = "v1.1.0"
+
+[[projects]]
+  name = "github.com/golang/protobuf"
+  packages = ["proto"]
+  revision = "b4deda0973fb4c70b50d226b1af49f3da59f5265"
   version = "v1.1.0"
 
 [[projects]]
@@ -59,6 +59,12 @@
   version = "v0.0.3"
 
 [[projects]]
+  name = "github.com/matttproud/golang_protobuf_extensions"
+  packages = ["pbutil"]
+  revision = "c12348ce28de40eed0136aa2b644d0ee0650e56c"
+  version = "v1.0.1"
+
+[[projects]]
   name = "github.com/pkg/errors"
   packages = ["."]
   revision = "645ef00459ed84a119197bfb8d8205042c6df63d"
@@ -71,19 +77,58 @@
   version = "v1.0.0"
 
 [[projects]]
+  name = "github.com/prometheus/client_golang"
+  packages = ["prometheus"]
+  revision = "c5b7fccd204277076155f10851dad72b76a49317"
+  version = "v0.8.0"
+
+[[projects]]
+  branch = "master"
+  name = "github.com/prometheus/client_model"
+  packages = ["go"]
+  revision = "5c3871d89910bfb32f5fcab2aa4b9ec68e65a99f"
+
+[[projects]]
+  branch = "master"
+  name = "github.com/prometheus/common"
+  packages = [
+    "expfmt",
+    "internal/bitbucket.org/ww/goautoneg",
+    "model"
+  ]
+  revision = "7600349dcfe1abd18d72d3a1770870d9800a7801"
+
+[[projects]]
+  branch = "master"
+  name = "github.com/prometheus/procfs"
+  packages = [
+    ".",
+    "internal/util",
+    "nfs",
+    "xfs"
+  ]
+  revision = "ae68e2d4c00fed4943b5f6698d504a5fe083da8a"
+
+[[projects]]
+  branch = "master"
+  name = "github.com/streadway/amqp"
+  packages = ["."]
+  revision = "e5adc2ada8b8efff032bf61173a233d143e9318e"
+
+[[projects]]
   name = "github.com/stretchr/testify"
   packages = [
     "assert",
     "require"
   ]
-  revision = "12b6f73e6084dad08a7c6e575284b177ecafbc71"
-  version = "v1.2.1"
+  revision = "f35b8ab0b5a2cef36673838d662e249dd9c94686"
+  version = "v1.2.2"
 
 [[projects]]
   branch = "master"
-  name = "github.com/troian/easygo"
-  packages = ["netpoll"]
-  revision = "6aa9ec42b14215a7f293153859340c9e4a34e59d"
+  name = "github.com/troian/healthcheck"
+  packages = ["."]
+  revision = "28210b882127d82f4af3797c25bcc85e7ea22533"
 
 [[projects]]
   name = "go.uber.org/atomic"
@@ -114,7 +159,7 @@
   branch = "master"
   name = "golang.org/x/sys"
   packages = ["unix"]
-  revision = "c11f84a56e43e20a78cee75a7c034031ecf57d1f"
+  revision = "1b2967e3c290b7c545b3db0deeda16e9be4f98a2"
 
 [[projects]]
   name = "gopkg.in/yaml.v2"
@@ -125,6 +170,6 @@
 [solve-meta]
   analyzer-name = "dep"
   analyzer-version = 1
-  inputs-digest = "e6bc98856cd72cc36715cf5c9ca106f1ebdff9661780051ae93b5f5a6b1b3bda"
+  inputs-digest = "295a8ae9d53f6fa95ec9f9d9f3971e3b60bd45c1d6b7756e84fa032fec4bdddf"
   solver-name = "gps-cdcl"
   solver-version = 1

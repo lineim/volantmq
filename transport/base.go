@@ -1,11 +1,11 @@
 package transport
 
 import (
+	"errors"
 	"sync"
 
 	"github.com/VolantMQ/volantmq/auth"
 	"github.com/VolantMQ/volantmq/systree"
-	"github.com/troian/easygo/netpoll"
 	"go.uber.org/zap"
 )
 
@@ -22,7 +22,6 @@ type Config struct {
 // InternalConfig used by server implementation to configure internal specific needs
 type InternalConfig struct {
 	Handler
-	netpoll.EventPoll
 	Metric systree.Metric
 }
 
@@ -42,7 +41,13 @@ type Provider interface {
 	Serve() error
 	Close() error
 	Port() string
+	Ready() error
+	Alive() error
 }
+
+var (
+	ErrListenerIsOff = errors.New("listener is off")
+)
 
 // Port return tcp port used by transport
 func (c *baseConfig) Port() string {
@@ -52,6 +57,15 @@ func (c *baseConfig) Port() string {
 // Protocol return protocol name used by transport
 func (c *baseConfig) Protocol() string {
 	return c.protocol
+}
+func (c *baseConfig) baseReady() error {
+	select {
+	case <-c.quit:
+		return ErrListenerIsOff
+	default:
+	}
+
+	return nil
 }
 
 // handleConnection is for the broker to handle an incoming connection from a client
